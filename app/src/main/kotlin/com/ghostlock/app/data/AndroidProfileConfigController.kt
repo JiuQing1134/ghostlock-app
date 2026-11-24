@@ -158,6 +158,16 @@ internal class AndroidProfileConfigController(
                 ) {
                     invalid += "$routePrefix.waiter_shift"
                 }
+                /* 0 = pselect, 1 = 6.1 compact pselect, 3 = 6.12 sigreturn.
+                 * 2 is the experimental vmsplice carrier; its waiter coverage
+                 * is not complete on this kernel, so never accept it from a
+                 * saved/imported profile. */
+                val compact = value("$routePrefix.compact_waiter")
+                if (compact != null &&
+                    (compact < 0L || compact > 3L || compact == 2L)
+                ) {
+                    invalid += "$routePrefix.compact_waiter"
+                }
             }
 
             "multicast_waiter" -> {
@@ -217,6 +227,12 @@ internal class AndroidProfileConfigController(
                         shift < Int.MIN_VALUE.toLong() || shift > Int.MAX_VALUE.toLong()
                     ) {
                         invalid += "$fallbackPrefix.waiter_shift"
+                    }
+                    val compact = value("$fallbackPrefix.compact_waiter")
+                    if (compact != null &&
+                        (compact < 0L || compact > 3L || compact == 2L)
+                    ) {
+                        invalid += "$fallbackPrefix.compact_waiter"
                     }
                 }
 
@@ -874,7 +890,7 @@ internal class AndroidProfileConfigController(
         /** Fields each route branch carries, used to seed a switched-to route. */
         private val RouteBranchFields = mapOf(
             "tcp_zerocopy" to listOf("compact_waiter"),
-            "select_stack" to listOf("waiter_shift"),
+            "select_stack" to listOf("waiter_shift", "compact_waiter"),
             "multicast_waiter" to listOf(
                 "waiter_off", "buffer_size", "task_offset", "lock_offset",
                 "compact_waiter",

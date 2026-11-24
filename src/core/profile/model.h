@@ -267,7 +267,10 @@ namespace ghostlock::profile {
 #undef GHOSTLOCK_EXEC_U32
 
         [[nodiscard]] bool has_compact_waiter() const noexcept {
-            return loaded_ && values_.misc.compact_waiter.value_or(0) != 0;
+            /* compact_waiter=1 is the 6.1 compact waiter layout. The 6.12
+             * vmsplice route reuses the field as a route-mode discriminator
+             * (2), but its rt_mutex_waiter layout is the 6.6/non-compact one. */
+            return loaded_ && values_.misc.compact_waiter.value_or(0) == 1;
         }
 
         [[nodiscard]] bool safe_mode() const noexcept {

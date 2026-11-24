@@ -30,7 +30,11 @@ object ProfileMerger {
         routePresets: Map<String, ValueMap>,
     ): ValueMap {
         val defaults = valueMapOf("release" to deviceRelease).apply {
-            if (tuningExecution != null) put("execution", tuningExecution)
+            /* Copy: deepMergeValues mutates the maps it walks, and the exporter
+             * reuses one tuningExecution instance for every profile. Without
+             * the copy, a profile's execution override (e.g. w1_attempts)
+             * leaks into the next profile's exported document. */
+            if (tuningExecution != null) put("execution", tuningExecution.copyValue())
         }
         val resolved = mergeSource(
             mergeSource(

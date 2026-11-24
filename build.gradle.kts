@@ -93,8 +93,15 @@ tasks.register<Delete>("clean") {
 tasks.register<Exec>("buildGhostlockNative") {
     description = "buildGhostlockNative"
     workingDir(file("src"))
-    commandLine("make", "ghostlock")
     val ndk = resolveNdkDir()
+    /* Plain "make" is not on PATH on the Windows host; use the NDK copy. */
+    val makeExecutable =
+        if (System.getProperty("os.name").lowercase().contains("windows")) {
+            File(ndk, "prebuilt/windows-x86_64/bin/make.exe").absolutePath
+        } else {
+            "make"
+        }
+    commandLine(makeExecutable, "ghostlock")
     environment("ANDROID_NDK_HOME", ndk)
     environment("NDK_ROOT", ndk)
     inputs.files(
